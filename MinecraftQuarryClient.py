@@ -3,6 +3,7 @@ from quarry.net.client import ClientProtocol, ClientFactory
 from quarry.net.auth import OfflineProfile, Profile
 from quarry.types.buffer import Buffer1_14
 from QuarryPlayer import Player, World, Entity, BlockFace, Hand, thread
+from bitstring import BitStream
 from random import getrandbits
 import time
 
@@ -32,9 +33,54 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
         self._transaction_ids = {}
 
     def packet_chunk_data(self, buff: Buffer1_14):
+
         chunk_x, chunk_z = buff.unpack('ii')
-        bitmask_length = buff.unpack_varint()
-        #buff.unpack_chunk()
+
+        bit_mask_length = buff.unpack_varint()
+        primary_bit_mask = buff.unpack_array('q', bit_mask_length)
+
+        height_maps = buff.unpack_nbt()
+        biomes_length = buff.unpack_varint()
+        biomes = []
+        for _ in range(biomes_length):
+            biomes.append(buff.unpack_varint())
+
+        size = buff.unpack_varint()
+        _size_counter = buff.pos
+
+        data = []
+        while (buff.pos - _size_counter) < size:
+            non_air_blocks = buff.unpack('h')
+            bits_per_block = buff.unpack('B')
+
+            bits_per_block = 4 if bits_per_block <= 4 else bits_per_block
+
+            palette_length = buff.unpack_varint()
+
+            palette = []
+            for _ in range(palette_length):
+                palette.append(buff.unpack_varint())
+
+            data_array_length = buff.unpack_varint()  # \x80\x02
+
+            # data_array = buff.unpack_array('q', data_array_length)
+            data_array = buff.read(8 * data_array_length)
+
+            data.append((non_air_blocks, bits_per_block, palette, data_array))
+
+        number_of_block_entities = buff.unpack_varint()
+
+        block_entities = []
+        for _ in range(number_of_block_entities):
+            block_entities.append(buff.unpack_varint())
+
+        self.quarry_client.world.chunks.load_new_chunk(chunk_x,
+                                                       chunk_z,
+                                                       primary_bit_mask,
+                                                       height_maps,
+                                                       biomes,
+                                                       data,
+                                                       block_entities)
 
     def packet_confirm_transaction(self, buff: Buffer1_14):
         #  before and including 1.16.5

@@ -3,6 +3,9 @@ from quarry.types.chat import Message
 from threading import Thread
 from enum import Enum
 from time import sleep
+from typing import Dict
+from bitstring import BitStream
+import numpy as np
 
 _MinecraftQuarryClient = object
 if __name__ == '__main__':
@@ -570,8 +573,106 @@ class EntitiesObject:
         self.entities: Dict[int, Entity] = {}
 
 
+class Chunk:
+    def __init__(self,
+                 chunks,
+                 chunk_x,
+                 chunk_z,
+                 primary_bit_mask,
+                 height_maps,
+                 biomes,
+                 data,
+                 block_entities):
+
+        self.chunks = chunks
+
+        self.chunk_x = chunk_x
+        self.chunk_z = chunk_z
+
+        self.biomes = biomes
+        self.height_map = height_maps
+        self.primary_bit_mask = primary_bit_mask
+
+        self._blocks = []
+        self.data = data
+        self.block_entities = block_entities
+
+    @property
+    def blocks(self):
+        if self._blocks == []:
+            self._compute_data_to_blocks()
+
+        return self._blocks
+
+    def _compute_data_to_blocks(self):
+
+        for non_air_blocks, bits_per_block, palette, data_array in self.data:
+            block_state_ids = []
+            stream = BitStream(data_array)
+            for _ in range(stream.length // bits_per_block):
+                block_state_ids.append(palette[stream.read(bits_per_block).int])
+
+            self._blocks.extend(block_state_ids)
+
+        self._blocks = np.array(self._blocks, dtype='uint8').reshape((16, 16, 16))
+
+
+class Chunks:
+    def __init__(self):
+        self._chunks: Dict[tuple, Chunk] = {}
+        self._computing_queue_status = False
+        self._computing_queue = []
+
+    def __getitem__(self, chunk_x_z) -> Chunk:
+        return self._chunks.get(chunk_x_z, None)
+
+    @thread
+    def _compute_blocks(self):
+
+        if self._computing_queue_status:
+            return -1
+
+        self._generating_queue = True
+
+        for chunk_x, chunk_z in self._computing_queue:
+
+            data = self._chunks[(chunk_x, chunk_z)].data
+            _blocks = self._chunks[(chunk_x, chunk_z)]._blocks
+
+            for non_air_blocks, bits_per_block, palette, data_array in data:
+
+                block_state_ids = \
+                    [[palette[stream.read(bits_per_block).int] for _ in range(stream.length // bits_per_block)] for stream
+                     in
+                     [BitStream(data_array)]][0]
+
+                _blocks.extend(block_state_ids)
+
+        self._computing_queue_status = False
+
+    def load_new_chunk(self,
+                       chunk_x,
+                       chunk_z,
+                       primary_bit_mask,
+                       height_maps,
+                       biomes,
+                       data,
+                       block_entities):
+
+        self._chunks[(chunk_x, chunk_z)] = Chunk(
+            self,
+            chunk_x,
+            chunk_z,
+            primary_bit_mask,
+            height_maps,
+            biomes,
+            data,
+            block_entities
+        )
+
 class World:
     def __init__(self, quarry_client: _MinecraftQuarryClient):
+        self.chunks = Chunks()
         self.ticks_per_second = 20
         self.quarry_client = quarry_client
         self.title_information = TitleInformation(self)
