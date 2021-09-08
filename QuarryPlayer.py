@@ -584,6 +584,7 @@ class Chunk:
                  data,
                  block_entities):
 
+        self.built = False
         self.chunks = chunks
 
         self.chunk_x = chunk_x
@@ -593,28 +594,53 @@ class Chunk:
         self.height_map = height_maps
         self.primary_bit_mask = primary_bit_mask
 
-        self._blocks = []
+        self._blocks = None
         self.data = data
         self.block_entities = block_entities
 
     @property
     def blocks(self):
-        if self._blocks == []:
-            self._compute_data_to_blocks()
+        if self._blocks is None:
+            return self._compute_data_to_blocks()
 
         return self._blocks
 
     def _compute_data_to_blocks(self):
 
+        block_state_ids = []
         for non_air_blocks, bits_per_block, palette, data_array in self.data:
-            block_state_ids = []
+            offset = 64 % bits_per_block
             stream = BitStream(data_array)
-            for _ in range(stream.length // bits_per_block):
-                block_state_ids.append(palette[stream.read(bits_per_block).int])
+            bits_per_long = 64 // bits_per_block
 
-            self._blocks.extend(block_state_ids)
+            # Variable needed because depending on the bits_per_block
+            # the last long could contain more information than needed (ex. needs more 5 blocks to reach 4096 but has
+            #                                                           more bits than 5 * bits_per_block)
+            added_blocks = 0
+            for i in range(stream.length // 64):  # Looping through each long in the data_array
+                long_bit_stream = BitStream(stream.read(64))  # reads a whole long
+                long_bit_stream.reverse()
 
-        self._blocks = np.array(self._blocks, dtype='uint8').reshape((16, 16, 16))
+                for _ in range(bits_per_long):
+                    index = long_bit_stream.read(bits_per_block)
+                    index.reverse()
+                    if added_blocks < 4096:
+                        block_state_ids.append(palette[index.uint])
+                        added_blocks += 1
+
+                long_bit_stream.read(offset)  # offset to fit block information into 64 bits (8bytes aka Long)
+
+        self._blocks = np.concatenate(
+            [
+                # This splits the blocks array into 16x16x16 blocks (4096 blocks)
+                # and then concatenates in the y axis for easy access
+                # (chunk.blocks[ANY_Y_VALUE][Z from 0 to 16][X from 0 to 16])
+                np.array(block_state_ids[i * 4096: (i + 1) * 4096], dtype='uint8').reshape((16, 16, 16)) for i in range(len(block_state_ids) // 4096)
+            ]
+        )
+        self.built = True
+
+        return self._blocks
 
 
 class Chunks:
@@ -625,6 +651,11 @@ class Chunks:
 
     def __getitem__(self, chunk_x_z) -> Chunk:
         return self._chunks.get(chunk_x_z, None)
+
+    def new_block_change(self, x, y, z, block_id):
+        chunk_x, chunk_z = x // 16, z // 16
+        if self[chunk_x, chunk_z] and self[chunk_x, chunk_z].built:
+            self[chunk_x, chunk_z].blocks[y][z % 16][x % 16] = block_id
 
     @thread
     def _compute_blocks(self):
@@ -669,6 +700,7 @@ class Chunks:
             data,
             block_entities
         )
+
 
 class World:
     def __init__(self, quarry_client: _MinecraftQuarryClient):

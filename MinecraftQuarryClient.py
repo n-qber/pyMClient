@@ -32,6 +32,13 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
         self._transaction_ids = {}
 
+    def packet_block_change(self, buff: Buffer1_14):
+        x, y, z = buff.unpack_position()
+
+        block_id = buff.unpack_varint()
+
+        self.quarry_client._on_block_change(x, y, z, block_id)
+
     def packet_chunk_data(self, buff: Buffer1_14):
 
         chunk_x, chunk_z = buff.unpack('ii')
@@ -66,13 +73,13 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
             # data_array = buff.unpack_array('q', data_array_length)
             data_array = buff.read(8 * data_array_length)
 
-            data.append((non_air_blocks, bits_per_block, palette, data_array))
+            data.append((non_air_blocks, bits_per_block, palette.copy(), data_array))
 
         number_of_block_entities = buff.unpack_varint()
 
         block_entities = []
         for _ in range(number_of_block_entities):
-            block_entities.append(buff.unpack_varint())
+            block_entities.append(buff.unpack_nbt())
 
         self.quarry_client.world.chunks.load_new_chunk(chunk_x,
                                                        chunk_z,
@@ -910,6 +917,13 @@ class MinecraftQuarryClient:
         self.on_window_confirmation(window_id, action_number, accepted)
 
     def on_window_confirmation(self, window_id, action_number, accepted):
+        pass
+
+    def _on_block_change(self, x, y, z, block_id):
+        self.world.chunks.new_block_change(x, y, z, block_id)
+        self.on_block_change(x, y, z, block_id)
+
+    def on_block_change(self, x, y, z, block_id):
         pass
 
 
