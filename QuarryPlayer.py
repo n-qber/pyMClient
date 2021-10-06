@@ -2,10 +2,10 @@ from quarry.types.buffer import Buffer1_14
 from quarry.types.chat import Message
 from threading import Thread
 from enum import Enum
-from time import sleep
 from typing import Dict
 from bitstring import BitStream
 import numpy as np
+import time
 
 _MinecraftQuarryClient = object
 if __name__ == '__main__':
@@ -49,7 +49,7 @@ class TitleInformation:
                 continue
             setattr(self, property_name, i)
             callback(i)
-            sleep((self.world.ticks_per_second ** -1) * (self.fade_in + self.stay + self.fade_out))
+            time.sleep((self.world.ticks_per_second ** -1) * (self.fade_in + self.stay + self.fade_out))
             getattr(self, array_name).pop()
 
         if process_variable:
@@ -465,11 +465,11 @@ class Window:
         self.ranges = {}
         self.full_size = None
 
-        self.id = None
+        self.id = 0
         self.type = None
         self.title = None
 
-        self.held_item = None
+        self.held_item = {'item': None}
 
         self.confirmations = []
 
@@ -530,17 +530,25 @@ class Window:
     def state_id(self):
         return self.inventory.state_id
 
+    @state_id.setter
+    def state_id(self, value: int):
+        self.inventory.state_id = value
+
 
 class Inventory:
 
     def __init__(self, player):
         self.player: Player = player
 
-        self.state_id = None
+        self.state_id = 0
         self.window = Window(self)
 
         self.slots = SlotsArray(size=46)
         self.selected_slot = 0
+
+    def clear(self):
+        del self.slots
+        self.slots = SlotsArray(size=46)
 
     @staticmethod
     def get_slots_from_type():
@@ -630,12 +638,13 @@ class Chunk:
 
                 long_bit_stream.read(offset)  # offset to fit block information into 64 bits (8bytes aka Long)
 
+        block_state_ids.extend(0 for _ in range((16 ** 4) - len(block_state_ids)))
         self._blocks = np.concatenate(
             [
                 # This splits the blocks array into 16x16x16 blocks (4096 blocks)
                 # and then concatenates in the y axis for easy access
                 # (chunk.blocks[ANY_Y_VALUE][Z from 0 to 16][X from 0 to 16])
-                np.array(block_state_ids[i * 4096: (i + 1) * 4096], dtype='uint8').reshape((16, 16, 16)) for i in range(len(block_state_ids) // 4096)
+                np.array(block_state_ids[i * 4096: (i + 1) * 4096], dtype='uint16').reshape((16, 16, 16)) for i in range(len(block_state_ids) // 4096)
             ]
         )
         self.built = True
@@ -644,18 +653,45 @@ class Chunk:
 
 
 class Chunks:
-    def __init__(self):
+
+    def __init__(self, world):
+        self.world = world
         self._chunks: Dict[tuple, Chunk] = {}
         self._computing_queue_status = False
         self._computing_queue = []
 
+        self.processing_new_chunks: bool = False
+        self.chunks_to_process = []
+
+    def clear(self):
+        self._chunks: Dict[tuple, Chunk] = {}
+        self._computing_queue_status = False
+        self._computing_queue = []
+        self.processing_new_chunks: bool = False
+        self.chunks_to_process = []
+
     def __getitem__(self, chunk_x_z) -> Chunk:
+        _chunk = self._chunks.get(chunk_x_z, None)
+        if type(_chunk) is bytes:
+            self.load_new_chunk(*self.unpack_chunk_data(Buffer1_14(_chunk)))
         return self._chunks.get(chunk_x_z, None)
+
+    def get_block(self, x, y, z):
+        chunk_x, chunk_z = x // 16, z // 16
+        if self[chunk_x, chunk_z] and self[chunk_x, chunk_z].built:
+            return self[chunk_x, chunk_z].blocks[y][z % 16][x % 16]
+        return None
 
     def new_block_change(self, x, y, z, block_id):
         chunk_x, chunk_z = x // 16, z // 16
         if self[chunk_x, chunk_z] and self[chunk_x, chunk_z].built:
             self[chunk_x, chunk_z].blocks[y][z % 16][x % 16] = block_id
+
+    def new_multi_block_change(self, chunk_x, chunk_y, chunk_z, blocks):
+        if self[chunk_x, chunk_z] and self[chunk_x, chunk_z].built:
+            y_factor = chunk_y * 16
+            for block_state_id, (x, y, z) in blocks:
+                self[chunk_x, chunk_z].blocks[y + y_factor][z][x] = block_state_id
 
     @thread
     def _compute_blocks(self):
@@ -701,18 +737,130 @@ class Chunks:
             block_entities
         )
 
+    def unpack_chunk_data(self, buff: Buffer1_14):
+        chunk_x, chunk_z = buff.unpack('ii')
+
+        bit_mask_length = buff.unpack_varint()
+        primary_bit_mask = buff.unpack_array('q', bit_mask_length)
+        bit_mask = BitStream()
+        if primary_bit_mask:
+            bit_mask = BitStream(', '.join(['0b' + bin(v)[2:].rjust(32, '0') for v in primary_bit_mask]))
+            bit_mask.reverse()
+
+        height_maps = buff.unpack_nbt()
+        biomes_length = buff.unpack_varint()
+        biomes = []
+        for _ in range(biomes_length):
+            biomes.append(buff.unpack_varint())
+
+        size = buff.unpack_varint()
+        _size_counter = buff.pos
+
+        data = []
+        while (buff.pos - _size_counter) < size:
+            try:
+                if not bit_mask.read(1).uint:
+                    data.append((0, 4, [0], b'\x00' * (4096 // 2)))
+                    continue
+            except Exception as ex:
+                (lambda *args, **kwargs: None)()
+
+            non_air_blocks = buff.unpack('h')
+            bits_per_block = buff.unpack('B')
+
+            bits_per_block = 4 if bits_per_block <= 4 else bits_per_block
+
+            palette_length = buff.unpack_varint()
+
+            palette = []
+            for _ in range(palette_length):
+                palette.append(buff.unpack_varint())
+
+            data_array_length = buff.unpack_varint()  # \x80\x02
+
+            # data_array = buff.unpack_array('q', data_array_length)
+            data_array = buff.read(8 * data_array_length)
+
+            data.append((non_air_blocks, bits_per_block, palette.copy(), data_array))
+        #data.extend(buff.unpack_chunk(bit_mask.uint))
+
+        number_of_block_entities = buff.unpack_varint()
+
+        block_entities = []
+        for _ in range(number_of_block_entities):
+            block_entities.append(buff.unpack_nbt())
+
+        return (chunk_x,
+                chunk_z,
+                primary_bit_mask,
+                height_maps,
+                biomes,
+                data,
+                block_entities)
+
+    @thread
+    def _process_new_chunks(self):
+
+        if self.processing_new_chunks:
+            return
+
+        self.processing_new_chunks = True
+        while self.chunks_to_process:
+            for buff in list(self.chunks_to_process):
+                self.load_new_chunk(*self.unpack_chunk_data(Buffer1_14(buff).unpack_chunk()))
+        self.processing_new_chunks = False
+
+    def new_chunk_data(self, buffer: bytes):
+        chunk_x, chunk_z = Buffer1_14(buffer).unpack('ii')
+        self._chunks[(chunk_x, chunk_z)] = buffer
+
 
 class World:
     def __init__(self, quarry_client: _MinecraftQuarryClient):
-        self.chunks = Chunks()
+        self.dimension = None
+        self.name = None
+        self.hashed_seed = None
+        self.is_debug = None
+        self.is_flat = None
+        self.max_players = None
+
+        self.load_chunks = True
+        self.chunks = Chunks(self)
         self.ticks_per_second = 20
-        self.quarry_client = quarry_client
+        self.quarry_client: _MinecraftQuarryClient = quarry_client
         self.title_information = TitleInformation(self)
         self.entities_object = EntitiesObject(self)
+
+        self.age = None
+        self.time_of_day = None
+        self._date_state_info = (
+            (0, "day"),
+            (6000, "noon"),
+            (12000, "sunset"),
+            (13000, "night"),
+            (18000, "midnight"),
+            (23000, "sunrise")
+        )
 
     @property
     def seconds_per_tick(self):
         return self.ticks_per_second ** -1
+
+    @property
+    def day_state(self):
+        if not self.time_of_day:
+            return None
+
+        for index, (ticks, state) in enumerate(self._date_state_info):
+            if self.time_of_day < ticks:
+                return self._date_state_info[index - 1][1]
+
+    def get_block_state_id(self, x, y, z):
+        chunk = self.chunks[x // 16, z // 16]
+        if chunk is None:
+            return None
+
+        return chunk.blocks[y][z % 16][x % 16]
 
 
 class Entity:
@@ -760,6 +908,17 @@ class Hand(Enum):
     OFF = 1
 
 
+class DiggingStatus(Enum):
+    START_DIGGING = 0
+    CANCEL_DIGGING = 1
+    FINISH_DIGGING = 2
+    DROP_ITEM_STACK = 3
+    DROP_ITEM = 4
+    SHOOT_ARROW = 5
+    FINISH_EATING = 5
+    SWAP_ITEM = 6
+
+
 class Player(Entity):
     def __init__(self, quarry_client: _MinecraftQuarryClient):
         super(Player, self).__init__(quarry_client)
@@ -772,6 +931,8 @@ class Player(Entity):
             main_hand=1,
             disable_text_filtering=True
         )
+
+        self.gamemode = None
 
         self.inventory = Inventory(self)
 
@@ -789,10 +950,60 @@ class Player(Entity):
 
     @sneaking.setter
     def sneaking(self, value):
-        [self.quarry_client.stop_sneaking, self.quarry_client.start_sneaking][value]()
+        self._sneaking = value
+        [self.quarry_client.stop_sneaking, self.quarry_client.start_sneaking][bool(value)]()
+        time.sleep(self.quarry_client.world.seconds_per_tick)
 
-    #def on_join_game_packet(self, packet):
-    #    self.player_id = self.entity_id = packet.entity_id
 
-    #def on_update_health_packet(self, packet):
-    #    self.health, self.food, self.food_saturation = packet.health, packet.food, packet.food_saturation
+class ConfirmationInformation:
+    def __init__(self, name, response=None, stack=False, debug=False):
+        self.name = name
+        self.stack = stack
+        self._response = response
+        self.responses = []
+        self.debug = False
+
+    @property
+    def status(self):
+        if bool(self.responses):
+            self._response = self.responses.pop(0)
+            return True
+        return False
+
+    @property
+    def response(self):
+        return self._response
+
+    @response.setter
+    def response(self, value):
+        if self.debug:
+            print(value)
+        self.responses.append(value)
+        if not self.stack:
+            while len(self.responses) > 1:
+                self.responses.pop(0)
+
+
+class Confirmations:
+    def __init__(self, client: _MinecraftQuarryClient):
+        self._confirmations = {}
+
+        for method_name in filter(lambda m: m.startswith('_on_'), dir(client)):
+            clear_name = method_name.lstrip('_on_')
+            self._confirmations[clear_name] = ConfirmationInformation(clear_name)
+            setattr(client, method_name, Confirmations.decorator(getattr(client, method_name), self._confirmations[clear_name]))
+
+    @staticmethod
+    def decorator(func, sensor):
+
+        def wrapper(*args, **kwargs):
+            sensor.response = (args, kwargs)
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    def __getattr__(self, item):
+        if item in self._confirmations:
+            return self._confirmations[item]
+
+        raise AttributeError

@@ -2,9 +2,8 @@ from twisted.internet import reactor
 from quarry.net.client import ClientProtocol, ClientFactory
 from quarry.net.auth import OfflineProfile, Profile
 from quarry.types.buffer import Buffer1_14
-from QuarryPlayer import Player, World, Entity, BlockFace, Hand, thread
+from QuarryPlayer import Player, World, Entity, BlockFace, Hand, DiggingStatus, thread
 from bitstring import BitStream
-from random import getrandbits
 import time
 
 
@@ -30,7 +29,84 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
         if quarry_client:
             self.quarry_client: MinecraftQuarryClient = quarry_client
 
-        self._transaction_ids = {}
+    def packet_login_disconnect(self, buff: Buffer1_14):
+        super(MinecraftQuarryClientProtocol, self).packet_login_disconnect(buff)
+        buff.restore()
+        reason = buff.unpack_chat()
+        return self.quarry_client._on_kicked(reason)
+
+    def packet_close_window(self, buff: Buffer1_14):
+        window_id = buff.unpack('B')
+
+        self.quarry_client._on_close_window(window_id)
+
+    def packet_respawn(self, buff: Buffer1_14):
+        dimension = buff.unpack_nbt()
+        world_name = buff.unpack_string()
+        hashed_seed = buff.unpack('q')
+        gamemode = buff.unpack('B')
+        previous_gamemode = buff.unpack('B')
+        is_debug = buff.unpack('?')
+        is_flat = buff.unpack('?')
+        copy_metadata = buff.unpack('?')
+
+        self.quarry_client._on_packet_respawn(dimension, world_name, hashed_seed, gamemode, previous_gamemode, is_debug, is_flat, copy_metadata)
+
+    def packet_block_break_animation(self, buff: Buffer1_14):
+        entity_id = buff.unpack_varint()
+        location = buff.unpack_position()
+        destroy_stage = buff.unpack('b')
+
+        self.quarry_client._on_block_break_animation(entity_id, location, destroy_stage)
+
+    def packet_block_metadata_response(self, buff: Buffer1_14):
+        transaction_id = buff.unpack_varint()
+        nbt = buff.unpack_nbt()
+        
+        self.quarry_client._on_block_metadata_response(transaction_id, nbt)
+
+    def packet_acknowledge_player_digging(self, buff: Buffer1_14):
+        location = buff.unpack_position()
+        block_state_id = buff.unpack_varint()
+        status = buff.unpack_varint()
+        successful = buff.unpack('?')
+
+        self.quarry_client._on_acknowledge_player_digging(location, block_state_id, DiggingStatus(status), successful)
+
+    def packet_tab_complete(self, buff: Buffer1_14):
+        _id = buff.unpack_varint()
+        start = buff.unpack_varint()
+        length = buff.unpack_varint()
+        count = buff.unpack_varint()
+
+        matches = []
+        for match_index in range(count):
+            match = buff.unpack_string()
+            has_tooltip = buff.unpack('?')
+            if has_tooltip:
+                tooltip = buff.unpack_chat()
+
+            matches.append((match, None if not has_tooltip else tooltip))
+
+        self.quarry_client._on_tab_complete(_id, start, length, matches)
+
+    def packet_multi_block_change(self, buff: Buffer1_14):
+        chunk_section_position_stream = BitStream(buff.read(8))
+        chunk_x, chunk_z, chunk_y = (
+            chunk_section_position_stream.read(22).int,
+            chunk_section_position_stream.read(22).int,
+            chunk_section_position_stream.read(20).int
+        )
+        buff.unpack('?')
+        blocks_array_size = buff.unpack_varint()
+        blocks = []
+        for _ in range(blocks_array_size):
+            block_varlong = BitStream('0b' + bin(buff.unpack_varint(max_bits=64))[2:].rjust(64, '0'))
+            block_state_id = block_varlong.read(block_varlong.length - 12).uint
+            x, z, y = block_varlong.read(4).uint, block_varlong.read(4).uint, block_varlong.read(4).uint
+            blocks.append((block_state_id, (x, y, z)))
+            
+        self.quarry_client._on_multi_block_change(chunk_x, chunk_y, chunk_z, blocks)
 
     def packet_block_change(self, buff: Buffer1_14):
         x, y, z = buff.unpack_position()
@@ -39,55 +115,13 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
         self.quarry_client._on_block_change(x, y, z, block_id)
 
+    def packet_time_update(self, buff: Buffer1_14):
+        world_age, time_of_day = buff.unpack('qq')
+
+        self.quarry_client._on_time_update(world_age, time_of_day)
+
     def packet_chunk_data(self, buff: Buffer1_14):
-
-        chunk_x, chunk_z = buff.unpack('ii')
-
-        bit_mask_length = buff.unpack_varint()
-        primary_bit_mask = buff.unpack_array('q', bit_mask_length)
-
-        height_maps = buff.unpack_nbt()
-        biomes_length = buff.unpack_varint()
-        biomes = []
-        for _ in range(biomes_length):
-            biomes.append(buff.unpack_varint())
-
-        size = buff.unpack_varint()
-        _size_counter = buff.pos
-
-        data = []
-        while (buff.pos - _size_counter) < size:
-            non_air_blocks = buff.unpack('h')
-            bits_per_block = buff.unpack('B')
-
-            bits_per_block = 4 if bits_per_block <= 4 else bits_per_block
-
-            palette_length = buff.unpack_varint()
-
-            palette = []
-            for _ in range(palette_length):
-                palette.append(buff.unpack_varint())
-
-            data_array_length = buff.unpack_varint()  # \x80\x02
-
-            # data_array = buff.unpack_array('q', data_array_length)
-            data_array = buff.read(8 * data_array_length)
-
-            data.append((non_air_blocks, bits_per_block, palette.copy(), data_array))
-
-        number_of_block_entities = buff.unpack_varint()
-
-        block_entities = []
-        for _ in range(number_of_block_entities):
-            block_entities.append(buff.unpack_nbt())
-
-        self.quarry_client.world.chunks.load_new_chunk(chunk_x,
-                                                       chunk_z,
-                                                       primary_bit_mask,
-                                                       height_maps,
-                                                       biomes,
-                                                       data,
-                                                       block_entities)
+        self.quarry_client.world.chunks.new_chunk_data(buff.read())
 
     def packet_confirm_transaction(self, buff: Buffer1_14):
         #  before and including 1.16.5
@@ -243,7 +277,6 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
             #  ABORT TELEPORT CONFIRM
             return
 
-        #print("server sent", x, y, z, yaw, pitch)
         self.teleport_confirm(teleport_id)
         self.quarry_client.set_player_position_and_rotation(x, y, z, yaw, pitch)
 
@@ -271,12 +304,6 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
             return
         buff.discard()
 
-    def _generate_new_transaction_id(self):
-        rn = getrandbits(32)
-        rn -= rn & (2 ** 31)
-        if rn in self._transaction_ids:
-            return self._generate_new_transaction_id()
-        return rn
 
     def send_plugin_message(self, channel='minecraft:brand', data='vanilla'):
         buff = Buffer1_14()
@@ -325,7 +352,7 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
     def swap_hands(self):
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(6))
+        buff.add(buff.pack_varint(DiggingStatus.SWAP_ITEM.value))
         buff.add(buff.pack_position(0, 0, 0))
         buff.add(buff.pack('B', 0))
         self.send_packet('player_digging', buff.read())
@@ -345,8 +372,41 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
         buff.read()
 
     def packet_join_game(self, buff: Buffer1_14):
-        self.quarry_client.player.player_id = self.quarry_client.player.entity_id = buff.unpack('i')
-        buff.read()
+        player_id = buff.unpack('i')
+        is_hardcore = buff.unpack('?')
+        gamemode = buff.unpack('B')
+        previous_gamemode = buff.unpack('b')
+        world_count = buff.unpack_varint()
+        world_names = []
+        for _ in range(world_count):
+            world_names.append(buff.unpack_string())
+
+        dimension_codec = buff.unpack_nbt()
+        dimension = buff.unpack_nbt()
+        world_name = buff.unpack_string()
+        hashed_seed = buff.unpack('q')
+        max_players = buff.unpack_varint()
+        view_distance = buff.unpack_varint()
+        reduced_debug_info = buff.unpack('?')
+        enable_respawn_screen = buff.unpack('?')
+        is_debug = buff.unpack('?')
+        is_flat = buff.unpack('?')
+
+        self.quarry_client._on_join_game(player_id,
+                                         is_hardcore,
+                                         gamemode,
+                                         previous_gamemode,
+                                         world_names,
+                                         dimension_codec,
+                                         dimension,
+                                         world_name,
+                                         hashed_seed,
+                                         max_players,
+                                         view_distance,
+                                         reduced_debug_info,
+                                         enable_respawn_screen,
+                                         is_debug,
+                                         is_flat)
 
     def player_joined(self, *args, **kwargs):
         super().player_joined()
@@ -362,10 +422,9 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
         self.send_packet('client_status', buff.read())
 
-    def send_nbt_query(self, x, y, z):
+    def send_nbt_query(self, transaction_id, x, y, z):
         buff = Buffer1_14()
 
-        transaction_id = self._generate_new_transaction_id()
         buff.add(buff.pack_varint(transaction_id))
         buff.add(buff.pack_position(x, y, z))
 
@@ -380,7 +439,7 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
     def update_held_item(self):
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(5))
+        buff.add(buff.pack_varint(DiggingStatus.SHOOT_ARROW.value))
         buff.add(buff.pack_position(0, 0, 0))
         buff.add(buff.pack('B', 0))
 
@@ -388,7 +447,7 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
     def drop_item(self):
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(4))
+        buff.add(buff.pack_varint(DiggingStatus.DROP_ITEM))
         buff.add(buff.pack_position(0, 0, 0))
         buff.add(buff.pack('B', 0))
 
@@ -396,7 +455,7 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
     def drop_stack(self):
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(3))
+        buff.add(buff.pack_varint(DiggingStatus.DROP_ITEM_STACK.value))
         buff.add(buff.pack_position(0, 0, 0))
         buff.add(buff.pack('B', 0))
 
@@ -467,15 +526,19 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
     def send_start_breaking(self, x, y, z, face):
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(0))
+        buff.add(buff.pack_varint(DiggingStatus.START_DIGGING))
         buff.add(buff.pack_position(x, y, z))
         buff.add(buff.pack('B', face))
 
         self.send_packet('player_digging', buff.read())
 
     def send_stop_breaking(self, x, y, z, face, operation="break"):
+        status = {
+            'cancel': DiggingStatus.CANCEL_DIGGING,
+            'break': DiggingStatus.FINISH_DIGGING
+        }.get(operation, DiggingStatus.FINISH_DIGGING)
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(int(operation != "cancel") + 1))
+        buff.add(buff.pack_varint(status))
         buff.add(buff.pack_position(x, y, z))
         buff.add(buff.pack('B', face))
 
@@ -495,11 +558,41 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
     def send_window_confirm(self, *args, **kwargs):
         self.send_confirm_transaction(*args, **kwargs)
 
+    def send_entity_action(self, entity_id, action_id, jump_boost: int = 0):
+        buff = Buffer1_14()
+        buff.add(
+            buff.pack_varint(entity_id) +
+            buff.pack_varint(action_id) +
+            buff.pack_varint(jump_boost)
+        )
+
+        self.send_packet('entity_action', buff.read())
+
     def send_confirm_transaction(self, window_id, action_number, accepted):
         buff = Buffer1_14()
         buff.add(buff.pack('bh?', window_id, action_number, accepted))
 
         self.send_packet('confirm_transaction', buff.read())
+
+    def send_tab_complete(self, transaction_id, text):
+        buff = Buffer1_14()
+
+        buff.add(
+            buff.pack_varint(transaction_id) +
+            buff.pack_string(text)
+        )
+
+        self.send_packet('tab_complete', buff.read())
+
+    def send_block_metadata_request(self, transaction_id, location):
+        buff = Buffer1_14()
+
+        buff.add(
+            buff.pack_varint(transaction_id) +
+            buff.pack_position(*location)
+        )
+
+        self.send_packet('block_metadata_request', buff.read())
 
 
 class MinecraftQuarryClient:
@@ -510,6 +603,7 @@ class MinecraftQuarryClient:
                  humanized: bool = True,
                  debug: bool = False):
 
+        self.confirmations = Confirmations(self)
         self.factory = MinecraftQuarryClientFactory(username, quarry_client=self)
         self.factory.protocol = MinecraftQuarryClientProtocol
 
@@ -604,6 +698,9 @@ class MinecraftQuarryClient:
     def get_block_nbt(self):
         self.factory.quarry_protocol.send_nbt_query(0, 0, 0)
 
+    def send_tab_complete(self, _id, text):
+        self.factory.quarry_protocol.send_tab_complete(_id, text)
+
     def send_chat_message(self, message):
         self.factory.quarry_protocol.send_chat_message(message)
 
@@ -626,6 +723,13 @@ class MinecraftQuarryClient:
 
         for _ in range(quantity):
             self.factory.quarry_protocol.drop_item()
+
+    def _on_player_position(self, x, y, z, on_ground):
+        self.player.x = x
+        self.player.y = y
+        self.player.z = z
+        self.player.on_ground = on_ground
+        return self.on_player_position(x, y, z, on_ground)
 
     def _on_player_position_and_look(self, x, y, z, yaw, pitch, teleport_id, flags, dismount_vehicle=False):
         self.player.x = x
@@ -840,6 +944,14 @@ class MinecraftQuarryClient:
         self.factory.quarry_protocol.send_start_breaking(x, y, z, face)
         self._break_block(x, y, z, face, ticks)
 
+    def start_breaking_block(self, x, y, z, face="top"):
+        face = getattr(BlockFace, face, BlockFace.TOP).value
+        self.factory.quarry_protocol.send_start_breaking(x, y, z, face)
+
+    def stop_breaking_block(self, x, y, z, face="top", operation="break"):
+        face = getattr(BlockFace, face, BlockFace.TOP).value
+        self.factory.quarry_protocol.send_stop_breaking(x, y, z, face, operation=operation)
+
     def place_block(self,
                     x,
                     y,
@@ -862,13 +974,10 @@ class MinecraftQuarryClient:
 
     def switch_slots(self, source: int, destination: int):
 
-        _source_item = self.player.inventory.slots[source]
-        _destination_item = self.player.inventory.slots[destination]
-
         # Select on the source item
         _status = False
         while not _status:
-            self.factory.quarry_protocol.send_click_window(source, _source_item, mode=0, button=0, window_id=0, action_id=1)
+            self.factory.quarry_protocol.send_click_window(source, self.player.inventory.slots[source], mode=0, button=0, window_id=0, action_id=1)
 
             # 1.17+ does not need a confirmation from the server
             if self.factory.quarry_protocol.protocol_version >= 755:
@@ -876,13 +985,13 @@ class MinecraftQuarryClient:
 
             _status = self.player.inventory.window.wait_action_id(0, 1)
 
-        self.player.inventory.slots[source] = {'item': None}
-        self.player.inventory.window.held_item = _source_item
+        self.player.inventory.window.held_item, self.player.inventory.slots[source] =\
+            self.player.inventory.slots[source], self.player.inventory.window.held_item
 
         # Place the item in the destination slot
         _status = False
         while not _status:
-            self.factory.quarry_protocol.send_click_window(destination, _destination_item, mode=0, button=0, window_id=0, action_id=2)
+            self.factory.quarry_protocol.send_click_window(destination, self.player.inventory.slots[destination], mode=0, button=0, window_id=0, action_id=2)
 
             # 1.17+ does not need a confirmation from the server
             if self.factory.quarry_protocol.protocol_version >= 755:
@@ -890,13 +999,13 @@ class MinecraftQuarryClient:
 
             _status = self.player.inventory.window.wait_action_id(0, 2)
 
-        self.player.inventory.slots[destination] = _source_item
-        self.player.inventory.window.held_item = _destination_item
+        self.player.inventory.window.held_item, self.player.inventory.slots[destination] =\
+            self.player.inventory.slots[destination], self.player.inventory.window.held_item
 
         # Place the old item of the destination slot in the source if needed
         _status = False
         while not _status:
-            self.factory.quarry_protocol.send_click_window(source, {'item': None}, mode=0, button=0, window_id=0, action_id=3)
+            self.factory.quarry_protocol.send_click_window(source, self.player.inventory.slots[source], mode=0, button=0, window_id=0, action_id=3)
 
             # 1.17+ does not need a confirmation from the server
             if self.factory.quarry_protocol.protocol_version >= 755:
@@ -904,8 +1013,8 @@ class MinecraftQuarryClient:
 
             _status = self.player.inventory.window.wait_action_id(0, 3)
 
-        self.player.inventory.slots[source] = _destination_item
-        self.player.inventory.window.held_item = {'item': None}
+        self.player.inventory.window.held_item, self.player.inventory.slots[source] =\
+            self.player.inventory.slots[source], self.player.inventory.window.held_item
 
     def _on_window_confirmation(self, window_id, action_number, accepted):
 
@@ -924,6 +1033,111 @@ class MinecraftQuarryClient:
         self.on_block_change(x, y, z, block_id)
 
     def on_block_change(self, x, y, z, block_id):
+        pass
+
+    def on_player_position(self, x, y, z, on_ground):
+        pass
+
+    def _on_time_update(self, world_age, time_of_day):
+        self.world.age = world_age
+        self.world.time_of_day = time_of_day % 24000
+
+        self.on_time_update(self.world.age, self.world.time_of_day, self.world.day_state)
+
+    def on_time_update(self, world_age, time_of_day, day_state):
+        pass
+
+    def _on_tab_complete(self, _id, start, length, matches):
+        self.on_tab_complete(_id, start, length, matches)
+
+    def on_tab_complete(self, _id, start, length, matches):
+        pass
+
+    def start_sneaking(self):
+        self.factory.quarry_protocol.send_entity_action(
+            self.player.entity_id, 0  # start sneaking ID
+        )
+
+    def stop_sneaking(self):
+        self.factory.quarry_protocol.send_entity_action(
+            self.player.entity_id, 1,  # stop sneaking ID
+        )
+
+    def _on_acknowledge_player_digging(self, location, block_state_id, status, successful):
+        self.on_acknowledge_player_digging(location, block_state_id, status, successful)
+
+    def on_acknowledge_player_digging(self, location, block_state_id, status, successful):
+        pass
+
+    def _on_block_metadata_response(self, transaction_id, nbt):
+        self.on_block_metadata_response(transaction_id, nbt)
+
+    def on_block_metadata_response(self, transaction_id, nbt):
+        pass
+
+    def request_block_metadata(self, x, y, z, transaction_id=0):
+        self.factory.quarry_protocol.send_block_metadata_request(transaction_id, (x, y, z))
+
+    def _on_block_break_animation(self, entity_id, location, destroy_stage):
+        self.on_block_break_animation(entity_id, location, destroy_stage)
+
+    def on_block_break_animation(self, entity_id, location, destroy_stage):
+        pass
+
+    def _on_packet_respawn(self, dimension, world_name, hashed_seed, gamemode, previous_gamemode, is_debug, is_flat,
+                           copy_metadata):
+        self.world.dimension = dimension
+        self.world.name = world_name
+        self.world.hashed_seed = hashed_seed
+        self.world.is_debug = is_debug
+        self.world.is_flat = is_flat
+        self.player.inventory.clear()
+
+        self.player.gamemode = gamemode
+
+        self.on_packet_respawn(dimension, world_name, hashed_seed, gamemode, previous_gamemode, is_debug, is_flat,
+                           copy_metadata)
+
+    def on_packet_respawn(self, dimension, world_name, hashed_seed, gamemode, previous_gamemode, is_debug, is_flat,
+                          copy_metadata):
+        pass
+
+    def _on_join_game(self, player_id, is_hardcore, gamemode, previous_gamemode, world_names, dimension_codec, dimension,
+                      world_name, hashed_seed, max_players, view_distance, reduced_debug_info, enable_respawn_screen,
+                      is_debug, is_flat):
+
+        self.player.player_id = self.player.entity_id = player_id
+        self.player.gamemode = gamemode
+        self.world.name = world_name
+        self.world.dimension = dimension
+        self.world.hashed_seed = hashed_seed
+        self.world.max_players = max_players
+        self.world.is_debug = is_debug
+        self.world.is_flat = is_flat
+
+        self.on_join_game(player_id, is_hardcore, gamemode, previous_gamemode, world_names, dimension_codec, dimension,
+                      world_name, hashed_seed, max_players, view_distance, reduced_debug_info, enable_respawn_screen,
+                      is_debug, is_flat)
+
+    def on_join_game(self, player_id, is_hardoce, gamemode, previous_gamemode, world_names, dimension_codec, dimension,
+                     world_name, hashed_seed, max_players, view_distance, reduced_debug_info, enable_respawn_screen,
+                     is_debug, is_flat):
+        pass
+
+    def _on_close_window(self, window_id):
+        self.player.inventory.window.id = 0
+
+    def _on_kicked(self, reason):
+        self.on_kicked(reason)
+
+    def on_kicked(self, reason):
+        pass
+
+    def _on_multi_block_change(self, chunk_x, chunk_y, chunk_z, blocks):
+        self.world.chunks.new_multi_block_change(chunk_x, chunk_y, chunk_z, blocks)
+        self.on_multi_block_change(chunk_x, chunk_y, chunk_z, blocks)
+
+    def on_multi_block_change(self, chunk_x, chunk_y, chunk_z, blocks):
         pass
 
 
