@@ -919,6 +919,12 @@ class DiggingStatus(Enum):
     SWAP_ITEM = 6
 
 
+class InteractionType(Enum):
+    INTERACT = 0
+    ATTACK = 1
+    INTERACT_AT = 2
+
+
 class Player(Entity):
     def __init__(self, quarry_client: _MinecraftQuarryClient):
         super(Player, self).__init__(quarry_client)

@@ -2,7 +2,7 @@ from twisted.internet import reactor
 from quarry.net.client import ClientProtocol, ClientFactory
 from quarry.net.auth import OfflineProfile, Profile
 from quarry.types.buffer import Buffer1_14
-from QuarryPlayer import Player, World, Entity, BlockFace, Hand, DiggingStatus, Confirmations, thread
+from QuarryPlayer import Player, World, Entity, BlockFace, Hand, DiggingStatus, Confirmations, thread, InteractionType
 from bitstring import BitStream
 import time
 
@@ -338,7 +338,9 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
         if self.quarry_client.player.username in ["", None]:
             self.quarry_client.player.username = self.quarry_client.player.display_name
 
-    def use_item(self, hand: int = 0):
+    def use_item(self, hand: Hand = 0):
+        if type(hand) is not int:
+            hand = hand.value
         buff = Buffer1_14()
         buff.add(buff.pack_varint(hand))
 
@@ -447,7 +449,7 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
     def drop_item(self):
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(DiggingStatus.DROP_ITEM))
+        buff.add(buff.pack_varint(DiggingStatus.DROP_ITEM.value))
         buff.add(buff.pack_position(0, 0, 0))
         buff.add(buff.pack('B', 0))
 
@@ -526,7 +528,7 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
 
     def send_start_breaking(self, x, y, z, face):
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(DiggingStatus.START_DIGGING))
+        buff.add(buff.pack_varint(DiggingStatus.START_DIGGING.value))
         buff.add(buff.pack_position(x, y, z))
         buff.add(buff.pack('B', face))
 
@@ -538,7 +540,7 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
             'break': DiggingStatus.FINISH_DIGGING
         }.get(operation, DiggingStatus.FINISH_DIGGING)
         buff = Buffer1_14()
-        buff.add(buff.pack_varint(status))
+        buff.add(buff.pack_varint(status.value))
         buff.add(buff.pack_position(x, y, z))
         buff.add(buff.pack('B', face))
 
@@ -593,6 +595,28 @@ class MinecraftQuarryClientProtocol(ClientProtocol):
         )
 
         self.send_packet('block_metadata_request', buff.read())
+
+    def send_interact_entity(self,
+                             entity_id,
+                             action_type,
+                             target_x=None,
+                             target_y=None,
+                             target_z=None,
+                             hand=0,
+                             sneaking=False):
+
+        if type(action_type) is str:
+            action_type: InteractionType = getattr(InteractionType, action_type, InteractionType.INTERACT)
+
+        buff = Buffer1_14()
+        buff.add(
+            buff.pack_varint(entity_id) +
+            buff.pack_varint(action_type.value) +
+            ((buff.pack('fff', target_x, target_y, target_z) + buff.pack_varint(int(hand))) if action_type == InteractionType.INTERACT_AT else b'') +
+            buff.pack('?', sneaking)
+        )
+
+        self.send_packet('use_entity', buff.read())
 
 
 class MinecraftQuarryClient:
@@ -705,8 +729,11 @@ class MinecraftQuarryClient:
         self.factory.quarry_protocol.send_chat_message(message)
 
     def use_item(self, hand="main"):
-        self.factory.quarry_protocol.use_item([0, 1][hand.lower() == "off"])
-        self.factory.quarry_protocol.update_held_item()
+
+        if type(hand) is str:
+            hand = getattr(Hand, hand.upper(), Hand.MAIN)
+
+        self.factory.quarry_protocol.use_item(hand)
 
     def on_update_health(self, health, food, food_saturation):
         pass
@@ -1140,8 +1167,34 @@ class MinecraftQuarryClient:
     def on_multi_block_change(self, chunk_x, chunk_y, chunk_z, blocks):
         pass
 
+    def interact_with(self,
+                      entity_id,
+                      action="interact",
+                      target_position=(None, None, None),
+                      hand=None,
+                      sneaking=None):
+
+        if sneaking is None:
+            sneaking = self.player.sneaking
+
+        action = action if type(action) is not str else getattr(InteractionType, action.upper(), InteractionType.INTERACT)
+
+        if action == InteractionType.INTERACT_AT:
+            assert target_position != (None, None, None), "Need [target_position] when using [interact_at] action"
+
+        if hand is None:
+            hand = Hand.MAIN
+
+        self.factory.quarry_protocol.send_interact_entity(entity_id, action, *target_position, hand, sneaking)
+
+    def eat(self, hand="main"):
+        self.confirmations.update_health.status  # clearing the status variable
+        self.use_item(hand)
+        while not self.confirmations.update_health.status:
+            time.sleep(self.world.seconds_per_tick)
+        self.factory.quarry_protocol.update_held_item()
+
 
 if __name__ == '__main__':
     client = MinecraftQuarryClient("pyMClient", debug=False)
     client.join_server(address="127.0.0.1", port=25565)
-    print()
