@@ -1187,11 +1187,12 @@ class MinecraftQuarryClient:
 
         self.factory.quarry_protocol.send_interact_entity(entity_id, action, *target_position, hand, sneaking)
 
+    @thread
     def eat(self, hand="main"):
         self.confirmations.update_health.status  # clearing the status variable
         self.use_item(hand)
         while not self.confirmations.update_health.status:
-            time.sleep(self.world.seconds_per_tick)
+            pass
         self.factory.quarry_protocol.update_held_item()
 
 
